@@ -6,7 +6,12 @@ import { PrismaClient } from '@prisma/client';
 import { log, error } from './logger.js';
 import { genOrderId, formatIDR } from './utils.js';
 import QRCode from 'qrcode';
-import { chargeQris, getTransactionStatus, createSnapTransaction, verifyMidtransSignature, isPaidStatus } from './midtrans.js';
+import {
+  createPayLink,
+  createQris,
+  tripay as Tripay,
+  midtrans as Midtrans
+} from './payment/index.js';
 
 // --- Admin helpers ---
 const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
@@ -18,9 +23,9 @@ function isAdminCtx(ctx) {
   const id = ctx?.from?.id ? String(ctx.from.id) : '';
   return ADMIN_IDS.includes(id);
 }
+
 // === Throttle helper (anti spam callback) ===
 const cbqRate = new Map(); // userId -> timestamp ms
-
 function shouldThrottle(id, ms = 2000) {
   const now = Date.now();
   const last = cbqRate.get(id) || 0;
@@ -28,15 +33,14 @@ function shouldThrottle(id, ms = 2000) {
   cbqRate.set(id, now);
   return false;
 }
-
 // optional: bersihkan entri lama biar nggak numpuk
 setInterval(() => {
   const cutoff = Date.now() - 60_000; // 1 menit
   for (const [id, t] of cbqRate) if (t < cutoff) cbqRate.delete(id);
 }, 60_000);
+
 // === Mini session untuk wizard admin ===
 const adminSessions = new Map(); // key: telegramId(string) -> {step, data}
-
 function getSess(ctx) {
   const id = String(ctx.from?.id || '');
   if (!adminSessions.has(id)) adminSessions.set(id, { step: null, data: {} });
@@ -55,23 +59,22 @@ function requireAdmin(handler) {
     return handler(ctx, ...args);
   };
 }
+
 // Escape HTML utk teks dinamis
 const esc = (s = '') =>
   String(s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+
 // --- [PATCH] pagination & format ringkas ---
 const PAGE_SIZE = 6; // 5–8 enak; aku set 6 biar rapi grid
-
-function shortIDR(n) {
-  return `Rp ${Number(n).toLocaleString('id-ID')}`;
-}
-// potong nama panjang tapi tetap kebaca
+const shortIDR = (n) => `Rp ${Number(n).toLocaleString('id-ID')}`;
 function trunc(s = '', max = 28) {
   s = String(s).trim();
   return s.length > max ? s.slice(0, max - 1) + '…' : s;
 }
+
 // keyboard utama
 function mainKeyboard(balance = 0) {
   const top = [
@@ -88,7 +91,7 @@ if (!TELEGRAM_BOT_TOKEN) {
   process.exit(1);
 }
 if (!PUBLIC_BASE_URL) {
-  console.error('Missing PUBLIC_BASE_URL in .env (ngrok URL)');
+  console.error('Missing PUBLIC_BASE_URL in .env');
   process.exit(1);
 }
 
@@ -103,7 +106,11 @@ const STATUS = {
 const prisma = new PrismaClient();
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const app = express();
-app.use(express.json());
+
+// RAW body untuk verifikasi HMAC Tripay
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf?.toString('utf8') || ''; }
+}));
 app.use(morgan('dev'));
 
 // === START ===
@@ -143,15 +150,13 @@ async function renderProductList(ctx, page = 1, messageId) {
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   if (page > pages) page = pages;
 
-const items = await prisma.product.findMany({
+  const items = await prisma.product.findMany({
     where,
     orderBy: { id: 'asc' },
     skip: (page - 1) * PAGE_SIZE,
     take: PAGE_SIZE,
     select: { id: true, name: true, priceIDR: true, slug: true }
   });
-
-  if (!items.length) { /* ... kosong: biarkan seperti sudah ada ... */ }
 
   // header ringkas
   const lines = [
@@ -161,7 +166,7 @@ const items = await prisma.product.findMany({
     'Pilih produk di bawah ini:'
   ];
 
-  // --- [OPTIMASI] hitung stok sekali untuk semua produk di halaman ini ---
+  // hitung stok sekali
   const ids = items.map(i => i.id);
   let stockMap = new Map();
   if (ids.length) {
@@ -175,19 +180,14 @@ const items = await prisma.product.findMany({
 
   const keyboard = [];
 
-  // satu tombol per produk (nama + harga + indikator)
   for (const p of items) {
     const stock = stockMap.get(p.id) ?? 0;
     const dot = stock > 0 ? '🟢' : '🔴';
     const label = `${trunc(p.name)} • ${shortIDR(p.priceIDR)} ${dot}`;
-
-    keyboard.push([{
-      text: label,
-      callback_data: `INFO_${p.slug}_p${page}`
-    }]);
+    keyboard.push([{ text: label, callback_data: `INFO_${p.slug}_p${page}` }]);
   }
 
-  // nav tetap
+  // nav
   const nav = [];
   if (page > 1) nav.push({ text: '◀️ Prev', callback_data: `CATALOG_${page - 1}` });
   nav.push({ text: `📄 ${page}/${pages}`, callback_data: 'NOOP' });
@@ -203,9 +203,9 @@ const items = await prisma.product.findMany({
   }
   return ctx.reply(text, opts);
 }
-// === [PATCH] Produk Populer: satu pesan + tombol per item ===
+
+// === [PATCH] Produk Populer ===
 async function renderPopularList(ctx, messageId) {
-  // ambil 5 item terbaru/terlaris (untuk simple: berdasarkan id desc)
   const items = await prisma.product.findMany({
     where: { isActive: true },
     orderBy: { id: 'desc' },
@@ -223,7 +223,6 @@ async function renderPopularList(ctx, messageId) {
     return ctx.reply(txt, opts);
   }
 
-  // hitung stok sekali (hemat query)
   const ids = items.map(i => i.id);
   const grouped = await prisma.productCredential.groupBy({
     by: ['productId'],
@@ -238,13 +237,8 @@ async function renderPopularList(ctx, messageId) {
   for (const p of items) {
     const stock = stockMap.get(p.id) ?? 0;
     const dot = stock > 0 ? '🟢' : '🔴';
-    keyboard.push([{
-      text: `${p.name} • ${shortIDR(p.priceIDR)} ${dot}`,
-      callback_data: `POPINFO_${p.slug}`
-    }]);
+    keyboard.push([{ text: `${p.name} • ${shortIDR(p.priceIDR)} ${dot}`, callback_data: `POPINFO_${p.slug}` }]);
   }
-
-  // opsional: shortcut ke katalog lengkap
   keyboard.push([{ text: '📦 Lihat Semua', callback_data: 'CATALOG_1' }]);
 
   const text = lines.join('\n');
@@ -256,6 +250,7 @@ async function renderPopularList(ctx, messageId) {
   }
   return ctx.reply(text, opts);
 }
+
 async function showProductList(ctx, page = 1, pageSize = 10) {
   page = Math.max(1, Number(page) || 1);
   const total = await prisma.product.count({ where: { isActive: true } });
@@ -272,26 +267,26 @@ async function showProductList(ctx, page = 1, pageSize = 10) {
   await ctx.reply(`📦 LIST PRODUK\npage ${page} / ${Math.max(1, Math.ceil(total / pageSize))}`);
 
   for (const p of items) {
-  const stock = await prisma.productCredential.count({
-    where: { productId: p.id, isUsed: false }
-  });
-  const status =stock > 0 ? '🟢 Tersedia' : '🔴 Habis';
-  await ctx.reply(
+    const stock = await prisma.productCredential.count({
+      where: { productId: p.id, isUsed: false }
+    });
+    const status = stock > 0 ? '🟢 Tersedia' : '🔴 Habis';
+    await ctx.reply(
       `<b>${esc(p.name)}</b> (${status})\n` +
       `${esc(p.description || '')}\n` +
       `Harga: ${formatIDR(p.priceIDR)}\n` +
       `Stock: ${stock}\n` +
       `Slug: <code>${esc(p.slug)}</code>`,
-    {
-      parse_mode: 'HTML',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: `🛒 Beli ${p.slug}`, callback_data: `BUY_${p.slug}` }]
-        ]
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: `🛒 Beli ${p.slug}`, callback_data: `BUY_${p.slug}` }]
+          ]
+        }
       }
-    }
-  );
-}
+    );
+  }
 }
 
 // === BUY ===
@@ -320,7 +315,6 @@ async function handleBuy(ctx, slug) {
         parse_mode: 'HTML',
         reply_markup: {
           inline_keyboard: [
-            [{ text: '🧾 Snap (semua metode)', url: `${process.env.PUBLIC_BASE_URL}/thanks` }],
             [{ text: '🟦 QRIS (tampilkan QR di chat)', callback_data: `PAY_QRIS_${recent.orderId}` }]
           ]
         }
@@ -347,17 +341,17 @@ async function handleBuy(ctx, slug) {
     }
   });
 
-  const snap = await createSnapTransaction({
+  const pay = await createPayLink({
     orderId: order.orderId,
-    grossAmount: order.priceIDR,
+    amount: order.priceIDR,
     customer: {
-      first_name: user.firstName || 'Telegram',
-      last_name: user.lastName || 'User',
+      name: `${user.firstName || 'Telegram'} ${user.lastName || 'User'}`.trim(),
       email: `${user.username || 'user'}@telegram.local`
-    }
+    },
+    items: [{ sku: product.slug, name: product.name, price: order.priceIDR, quantity: 1 }],
+    callbackUrl: `${process.env.PUBLIC_BASE_URL}/payment/webhook`,
+    returnUrl: `${process.env.PUBLIC_BASE_URL}/thanks?o=${order.orderId}`
   });
-
-  await prisma.order.update({ where: { id: order.id }, data: { midtransOrderId: order.orderId } });
 
   await ctx.reply(
     `🧾 Order <b>${esc(product.name)}</b>\n` +
@@ -367,16 +361,16 @@ async function handleBuy(ctx, slug) {
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [
-          [{ text: '🧾 Snap (semua metode)', url: snap.redirect_url }],
+          [{ text: '🧾 Bayar', url: pay.checkoutUrl || `${process.env.PUBLIC_BASE_URL}/pay/${order.orderId}` }],
           [{ text: '🟦 QRIS (tampilkan QR di chat)', callback_data: `PAY_QRIS_${order.orderId}` }]
         ]
       }
     }
   );
 }
+
 // === Action lock (hindari double-processing klik yang sama) ===
 const actionLocks = new Set(); // key: `${userId}:${data}`
-
 async function withLock(key, fn) {
   if (actionLocks.has(key)) return null; // sudah berjalan
   actionLocks.add(key);
@@ -386,11 +380,12 @@ async function withLock(key, fn) {
     setTimeout(() => actionLocks.delete(key), 3000); // lepas setelah 3s
   }
 }
+
 // === Callback Handler (ADMIN_ / BUY_ / PAY_QRIS_ / CHK_) ===
 bot.on('callback_query', async (ctx) => {
   const uid = String(ctx.from?.id || '');
   if (shouldThrottle(uid, 2000)) {
-  return ctx.answerCbQuery('⏳ Tunggu sebentar...', { show_alert: false });
+    return ctx.answerCbQuery('⏳ Tunggu sebentar...', { show_alert: false });
   }
   const data = ctx.callbackQuery?.data || '';
   console.log('[cbq]', data, 'from', ctx.from?.id);
@@ -402,12 +397,11 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    // mulai wizard tambah produk
     if (data === 'ADMIN_ADD_PRODUCT') {
       const s = getSess(ctx);
       s.step = 'NAME';
       s.data = {};
-      await ctx.answerCbQuery('Mulai tambah produk…'); // hilangkan spinner
+      await ctx.answerCbQuery('Mulai tambah produk…');
       await ctx.reply(
         '➕ Tambah Produk\n\nKetik *nama produk*:',
         { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Batal', callback_data: 'ADMIN_CANCEL_WIZ' }]] } }
@@ -415,7 +409,6 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    // batal wizard
     if (data === 'ADMIN_CANCEL_WIZ') {
       clearSess(ctx);
       await ctx.answerCbQuery('Dibatalkan');
@@ -423,9 +416,8 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    // daftar produk
     if (data === 'ADMIN_LIST_PRODUCTS') {
-      await ctx.answerCbQuery(); // tutup spinner
+      await ctx.answerCbQuery();
       const items = await prisma.product.findMany({ orderBy: { id: 'asc' } });
       if (!items.length) { await ctx.reply('Belum ada produk.'); return; }
       const lines = items.map(p => `• ${p.id}. ${p.name} — ${p.isActive ? 'AKTIF' : 'NONAKTIF'} — ${formatIDR(p.priceIDR)}`);
@@ -433,7 +425,6 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    // ringkas transaksi
     if (data === 'ADMIN_STATS') {
       await ctx.answerCbQuery();
       const [totalOrder, paid, fulfilled] = await Promise.all([
@@ -444,28 +435,28 @@ bot.on('callback_query', async (ctx) => {
       await ctx.reply(`Total order: ${totalOrder}\nPaid: ${paid}\nFulfilled: ${fulfilled}`);
       return;
     }
-    // --- Mulai tambah stok untuk produk tertentu ---
+
     if (data.startsWith('ADMIN_ADD_STOCK_')) {
       const slug = data.replace('ADMIN_ADD_STOCK_', '');
       const product = await prisma.product.findUnique({ where: { slug } });
-    if (!product) {
-      await ctx.answerCbQuery('Produk tidak ditemukan', { show_alert: true });
-      return;
-    }
+      if (!product) {
+        await ctx.answerCbQuery('Produk tidak ditemukan', { show_alert: true });
+        return;
+      }
       const s = getSess(ctx);
       s.step = 'ADD_STOCK';
       s.data = { productId: product.id, productName: product.name };
       await ctx.answerCbQuery('Tambah stok…');
       await ctx.reply(
-      `Kirim daftar credential untuk <b>${esc(product.name)}</b>\n` +
-      `• Satu baris = satu kode/akun\n` +
-      `• Bisa paste beberapa baris sekaligus\n\n` +
-      `Ketik /cancel untuk batal.`,
-    { parse_mode: 'HTML' }
-    );
-    return;
+        `Kirim daftar credential untuk <b>${esc(product.name)}</b>\n` +
+        `• Satu baris = satu kode/akun\n` +
+        `• Bisa paste beberapa baris sekaligus\n\n` +
+        `Ketik /cancel untuk batal.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
     }
-    // simpan produk (point #4)
+
     if (data === 'ADMIN_CONFIRM_ADD_ACTIVE' || data === 'ADMIN_CONFIRM_ADD_INACTIVE') {
       const s = getSess(ctx);
       if (!s.step || !s.data?.name) {
@@ -500,8 +491,9 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    return; // penting: hentikan di sini
+    return; // penting
   }
+
   // -------- [PATCH] label tengah (no-op) --------
   if (data === 'NOOP') {
     await ctx.answerCbQuery('Gunakan tombol Prev/Next ya 👌');
@@ -516,21 +508,15 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
-  // -------- [PATCH] Product detail (1 kartu) --------
+  // -------- [PATCH] Product detail --------
   if (data.startsWith('INFO_')) {
     await ctx.answerCbQuery();
-    // format: INFO_<slug>_p<page>
     const [, slug, ptag] = data.split('_');
     const page = Number((ptag || 'p1').replace(/^p/, '')) || 1;
 
     const p = await prisma.product.findUnique({ where: { slug } });
-    if (!p) {
-      await ctx.reply('Produk tidak ditemukan.');
-      return;
-    }
-    const stock = await prisma.productCredential.count({
-      where: { productId: p.id, isUsed: false }
-    });
+    if (!p) { await ctx.reply('Produk tidak ditemukan.'); return; }
+    const stock = await prisma.productCredential.count({ where: { productId: p.id, isUsed: false } });
     const dot = stock > 0 ? '🟢 Tersedia' : '🔴 Habis';
 
     const txt =
@@ -555,21 +541,19 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
-  // -------- [PATCH] Back to list --------
   if (data.startsWith('BACK_LIST_')) {
     const page = Number(data.replace('BACK_LIST_', '')) || 1;
     await ctx.answerCbQuery();
     await renderProductList(ctx, page, ctx.callbackQuery?.message?.message_id);
     return;
   }
-  // -------- [PATCH] buka daftar populer --------
+
   if (data === 'POPULAR') {
     await ctx.answerCbQuery();
     await renderPopularList(ctx, ctx.callbackQuery?.message?.message_id);
     return;
   }
 
-  // -------- [PATCH] detail dari populer --------
   if (data.startsWith('POPINFO_')) {
     await ctx.answerCbQuery();
     const slug = data.replace('POPINFO_', '');
@@ -593,10 +577,8 @@ bot.on('callback_query', async (ctx) => {
       reply_markup: {
         inline_keyboard: [
           [{ text: '🛒 Beli', callback_data: `BUY_${p.slug}` }],
-          [
-            { text: '⬅️ Kembali (Populer)', callback_data: 'BACK_POP' },
-            { text: '📦 Lihat Semua', callback_data: 'CATALOG_1' }
-          ]
+          [{ text: '⬅️ Kembali (Populer)', callback_data: 'BACK_POP' },
+           { text: '📦 Lihat Semua', callback_data: 'CATALOG_1' }]
         ]
       }
     };
@@ -606,132 +588,185 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
-  // -------- [PATCH] kembali ke daftar populer --------
   if (data === 'BACK_POP') {
     await ctx.answerCbQuery();
     await renderPopularList(ctx, ctx.callbackQuery?.message?.message_id);
     return;
   }
+
   // -------- BUY flow --------
   if (data.startsWith('BUY_')) {
-  const key = `${ctx.from.id}:${data}`;
-  const ran = await withLock(key, async () => {
-    log(`[ORDER] ${ctx.from.username || ctx.from.id} klik BUY ${data}`);
-    const slug = data.replace('BUY_', '');
-    try {
-      await ctx.editMessageReplyMarkup({
-        inline_keyboard: [[{ text: '⏳ Processing...', callback_data: 'NOOP' }]]
-      });
-    } catch {}
-    await ctx.answerCbQuery('Memproses pesanan…');
-    await handleBuy(ctx, slug);
-  });
-  if (ran === null) await ctx.answerCbQuery('⏳ Sedang diproses…');
-  return;
-}
+    const key = `${ctx.from.id}:${data}`;
+    const ran = await withLock(key, async () => {
+      log(`[ORDER] ${ctx.from.username || ctx.from.id} klik BUY ${data}`);
+      const slug = data.replace('BUY_', '');
+      try {
+        await ctx.editMessageReplyMarkup({
+          inline_keyboard: [[{ text: '⏳ Processing...', callback_data: 'NOOP' }]]
+        });
+      } catch {}
+      await ctx.answerCbQuery('Memproses pesanan…');
+      await handleBuy(ctx, slug);
+    });
+    if (ran === null) await ctx.answerCbQuery('⏳ Sedang diproses…');
+    return;
+  }
+
   // -------- QRIS charge --------
   if (data.startsWith('PAY_QRIS_')) {
-  const key = `${ctx.from.id}:${data}`;
-  const ran = await withLock(key, async () => {
-    log(`[PAY] ${ctx.from.username || ctx.from.id} minta QRIS untuk ${data}`);
-    const orderId = data.replace('PAY_QRIS_', '');
-    const order = await prisma.order.findUnique({
-      where: { orderId },
-      include: { product: true, user: true }
-    });
-    if (!order) {
-      await ctx.answerCbQuery('Order tidak ditemukan', { show_alert: true });
-      return;
-    }
-
-    try {
-      const { qr_string, qr_url } = await chargeQris({
-        orderId: order.orderId,
-        grossAmount: order.priceIDR
+    const key = `${ctx.from.id}:${data}`;
+    const ran = await withLock(key, async () => {
+      log(`[PAY] ${ctx.from.username || ctx.from.id} minta QRIS untuk ${data}`);
+      const orderId = data.replace('PAY_QRIS_', '');
+      const order = await prisma.order.findUnique({
+        where: { orderId },
+        include: { product: true, user: true }
       });
-      let photo;
-      if (qr_string) {
-        const png = await QRCode.toBuffer(qr_string, { width: 460, margin: 1 });
-        photo = { source: Buffer.from(png) };
-      } else {
-        const { default: axios } = await import('axios');
-        const resp = await axios.get(qr_url, { responseType: 'arraybuffer' });
-        photo = { source: Buffer.from(resp.data) };
+      if (!order) {
+        await ctx.answerCbQuery('Order tidak ditemukan', { show_alert: true });
+        return;
       }
-      await ctx.answerCbQuery();
-      await ctx.replyWithPhoto(photo, {
-        caption:
-          `Scan QRIS untuk bayar <b>${esc(order.product.name)}</b>\n` +
-          `Total: ${formatIDR(order.priceIDR)}\n\n` +
-          `Catatan: QR berlaku ±15 menit. Setelah bayar, bot akan auto-kirim data.`,
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [[{ text: '🔄 Cek status bayar', callback_data: `CHK_${order.orderId}` }]]
-        }
-      });
-    } catch (e) {
-      const hint = e.message?.slice(0, 300) || 'unknown';
-      await ctx.answerCbQuery('Gagal membuat QRIS', { show_alert: true });
-      await ctx.reply('Gagal membuat QRIS. Detail: ' + hint);
-    }
-  });
-  if (ran === null) await ctx.answerCbQuery('⏳ Sedang diproses…');
-  return;
-}
-  // -------- Cek status bayar --------
-  if (data.startsWith('CHK_')) {
-  const key = `${ctx.from.id}:${data}`;
-  const ran = await withLock(key, async () => {
-    log(`[CHECK] ${ctx.from.username || ctx.from.id} cek status ${data}`);
-    const orderId = data.replace('CHK_', '');
-    try {
-      const st = await getTransactionStatus(orderId);
-      await ctx.answerCbQuery(`Status: ${st.transaction_status || 'unknown'}`, { show_alert: true });
-    } catch {
-      await ctx.answerCbQuery('Gagal cek status', { show_alert: true });
-    }
-  });
-  if (ran === null) await ctx.answerCbQuery('⏳ Sedang diproses…');
-  return;
-}
-});
-// === Webhook Midtrans ===
-app.post('/midtrans/webhook', async (req, res) => {
-  try {
-    const body = req.body || {};
-    if (!verifyMidtransSignature(body)) return res.status(403).json({ ok: false });
-    const order = await prisma.order.findUnique({ where: { orderId: body.order_id }, include: { user: true, product: true } });
-    if (!order) return res.status(404).json({ ok: false });
-    const status = String(body.transaction_status || '').toLowerCase();
 
-    if (isPaidStatus(status) && order.status !== STATUS.FULFILLED) {
+      try {
+        const { qrString, qrUrl } = await createQris({
+          orderId: order.orderId,
+          amount: order.priceIDR
+        });
+
+        let photo;
+        if (qrString) {
+          const png = await QRCode.toBuffer(qrString, { width: 460, margin: 1 });
+          photo = { source: Buffer.from(png) };
+        } else if (qrUrl) {
+          const { default: axios } = await import('axios');
+          const resp = await axios.get(qrUrl, { responseType: 'arraybuffer' });
+          photo = { source: Buffer.from(resp.data) };
+        }
+
+        await ctx.answerCbQuery();
+        await ctx.replyWithPhoto(photo, {
+          caption:
+            `Scan QRIS untuk bayar <b>${esc(order.product.name)}</b>\n` +
+            `Total: ${formatIDR(order.priceIDR)}\n\n` +
+            `Catatan: QR berlaku ±15 menit. Setelah bayar, bot akan auto-kirim data.`,
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [[{ text: '🔄 Cek status bayar', callback_data: `CHK_${order.orderId}` }]]
+          }
+        });
+      } catch (e) {
+        const hint = e.message?.slice(0, 300) || 'unknown';
+        await ctx.answerCbQuery('Gagal membuat QRIS', { show_alert: true });
+        await ctx.reply('Gagal membuat QRIS. Detail: ' + hint);
+      }
+    });
+    if (ran === null) await ctx.answerCbQuery('⏳ Sedang diproses…');
+    return;
+  }
+
+  // -------- Cek status bayar (informasi aja; status final via webhook) --------
+  if (data.startsWith('CHK_')) {
+    await ctx.answerCbQuery('Menunggu callback dari payment gateway…', { show_alert: true });
+    return;
+  }
+});
+
+// === WEBHOOKS ===
+
+// Normalizer → 1 jalur update DB & kirim credential
+async function handleNormalizedPayment(parsed, res) {
+  const { orderId, status, provider } = parsed;
+
+  const order = await prisma.order.findUnique({
+    where: { orderId },
+    include: { user: true, product: true }
+  });
+  if (!order) return res.status(404).json({ ok: false });
+
+  const paid = (provider === 'tripay') ? Tripay.isPaid(status) : Midtrans.isPaid(status);
+
+  if (paid) {
+    if (order.status !== STATUS.FULFILLED) {
       if (order.status !== STATUS.PAID) {
         await prisma.order.update({ where: { id: order.id }, data: { status: STATUS.PAID } });
       }
-      const credential = await prisma.productCredential.findFirst({ where: { productId: order.productId, isUsed: false }, orderBy: { id: 'asc' } });
+      const credential = await prisma.productCredential.findFirst({
+        where: { productId: order.productId, isUsed: false },
+        orderBy: { id: 'asc' }
+      });
       if (!credential) {
-        await notifyUser(order.user.telegramId, `Pembayaran <b>${esc(order.product.name)}</b> sukses ✅\nTapi stok habis, admin akan follow up.`, true);
+        await notifyUser(order.user.telegramId,
+          `Pembayaran <b>${esc(order.product.name)}</b> sukses ✅\nNamun stok habis, admin akan follow up.`,
+          true
+        );
         return res.json({ ok: true, note: 'Paid, no stock' });
       }
-      await prisma.productCredential.update({ where: { id: credential.id }, data: { isUsed: true, usedAt: new Date() } });
-      await prisma.order.update({ where: { id: order.id }, data: { status: STATUS.FULFILLED, deliveredPayload: credential.payload } });
+      await prisma.productCredential.update({
+        where: { id: credential.id },
+        data: { isUsed: true, usedAt: new Date() }
+      });
+      await prisma.order.update({
+        where: { id: order.id },
+        data: { status: STATUS.FULFILLED, deliveredPayload: credential.payload }
+      });
       const msg =
         `Terima kasih! Pembayaran <b>${esc(order.product.name)}</b> sukses ✅\n\n` +
         `Data:\n<pre><code>${esc(credential.payload)}</code></pre>`;
       await notifyUser(order.user.telegramId, msg, true);
-      return res.json({ ok: true, fulfilled: true });
     }
-
-    if (['cancel', 'deny', 'expire', 'failure'].includes(status)) {
-      await prisma.order.update({ where: { id: order.id }, data: { status: STATUS.FAILED } });
-      await notifyUser(order.user.telegramId, `Transaksi <b>${esc(order.product.name)}</b> ${status.toUpperCase()}.`, true);
-      return res.json({ ok: true });
-    }
-    return res.json({ ok: true, status });
-  } catch (e) {
-    error('midtrans webhook error', e);
-    return res.status(500).json({ ok: false, message: e.message });
+    return res.json({ ok: true });
   }
+
+  // gagal / expired / cancel
+  const failSet = new Set(['FAILED', 'EXPIRED', 'REFUND', 'CANCEL', 'DENY', 'EXPIRE', 'FAILURE']);
+  if (failSet.has(String(status).toUpperCase())) {
+    await prisma.order.update({ where: { id: order.id }, data: { status: STATUS.FAILED } });
+    await notifyUser(
+      order.user.telegramId,
+      `Transaksi <b>${esc(order.product.name)}</b> ${String(status).toUpperCase()}.`,
+      true
+    );
+  }
+  return res.json({ ok: true, status });
+}
+
+// 1) Endpoint generik (auto-deteksi)
+app.post('/payment/webhook', async (req, res) => {
+  const raw = req.rawBody || '';
+  const tripaySig = req.header('X-Callback-Signature') || '';
+  let parsed, verified = false;
+
+  if (tripaySig && Tripay.verifyWebhook(raw, tripaySig)) {
+    parsed = Tripay.parseWebhook(req.body);
+    verified = true;
+  } else {
+    // Midtrans: verifikasi sesuai wrapper (gunakan raw body JSON)
+    if (Midtrans.verifyWebhook(raw, req.header('X-Signature') || '')) {
+      parsed = Midtrans.parseWebhook(JSON.parse(raw || '{}'));
+      verified = true;
+    }
+  }
+
+  if (!verified) return res.status(403).json({ ok: false, error: 'invalid signature' });
+  await handleNormalizedPayment(parsed, res);
+});
+
+// 2) Endpoint spesifik (Tripay)
+app.post('/tripay/webhook', async (req, res) => {
+  if (!Tripay.verifyWebhook(req.rawBody || '', req.header('X-Callback-Signature') || '')) {
+    return res.status(403).json({ ok: false });
+  }
+  const parsed = Tripay.parseWebhook(req.body);
+  await handleNormalizedPayment(parsed, res);
+});
+
+// 3) Endpoint spesifik (Midtrans)
+app.post('/midtrans/webhook', async (req, res) => {
+  if (!Midtrans.verifyWebhook(req.rawBody || '', req.header('X-Signature') || '')) {
+    return res.status(403).json({ ok: false });
+  }
+  const parsed = Midtrans.parseWebhook(JSON.parse(req.rawBody || '{}'));
+  await handleNormalizedPayment(parsed, res);
 });
 
 async function notifyUser(telegramId, message, html = false) {
@@ -747,21 +782,20 @@ await bot.telegram.setMyCommands([
   { command: 'stok',  description: 'laporan stok produk' },
   { command: 'saldo', description: 'cek saldo' },
   { command: 'admin', description: 'panel admin' },
-  { command: 'help', description: "bantuan"}
+  { command: 'help', description: 'bantuan' }
 ]);
+
 bot.command('help', async (ctx) => {
   await ctx.reply(
     '📖 Cara penggunaan bot:\n' +
     '• /list → lihat daftar produk\n' +
     '• /saldo → cek saldo kamu\n' +
-    '• /stok → cek stok produk (user bisa lihat total stok)\n\n' +
+    '• /stok → cek stok produk\n\n' +
     'Atau pakai tombol menu di bawah chat. 👇'
   );
 });
-// bot.command('list',  (ctx) => showProductList(ctx, 1));
 bot.command('list',  (ctx) => renderProductList(ctx, 1));
 bot.command('saldo', (ctx) => ctx.reply('Saldo kamu: Rp. 0'));
-
 bot.command('stok',  async (ctx) => {
   const aktif = await prisma.product.findMany({ where: { isActive: true }, orderBy: { id: 'asc' } });
   if (!aktif.length) return ctx.reply('Belum ada produk aktif.');
@@ -772,6 +806,7 @@ bot.command('stok',  async (ctx) => {
   }
   await ctx.reply(lines.join('\n'));
 });
+
 // === Admin panel (protected) ===
 bot.command('admin', requireAdmin(async (ctx) => {
   await ctx.reply(
@@ -787,37 +822,15 @@ bot.command('admin', requireAdmin(async (ctx) => {
     }
   );
 }));
-bot.command('stokadmin', requireAdmin(async (ctx) => {
-  const items = await prisma.product.findMany({ orderBy: { id: 'asc' } });
-  if (!items.length) return ctx.reply('Belum ada produk.');
-  for (const p of items) {
-    const stock = await prisma.productCredential.count({ where: { productId: p.id, isUsed: false } });
-    await ctx.reply(
-      `<b>${esc(p.name)}</b>\n` +
-      `Harga: ${formatIDR(p.priceIDR)}\n` +
-      `Status: ${p.isActive ? 'AKTIF' : 'NONAKTIF'}\n` +
-      `Slug: <code>${esc(p.slug)}</code>\n` +
-      `Stok: ${stock}`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '➕ Tambah Stok', callback_data: `ADMIN_ADD_STOCK_${p.slug}` }]
-          ]
-        }
-      }
-    );
-  }
-}));
+
 // === Wizard Tambah Produk (khusus admin) ===
 bot.on('text', async (ctx, next) => {
   const s = getSess(ctx);
-  if (!s.step) return next();            // bukan sedang wizard
-  if (!isAdminCtx(ctx)) return next();   // wizard hanya untuk admin
+  if (!s.step) return next();
+  if (!isAdminCtx(ctx)) return next();
 
   const text = (ctx.message?.text || '').trim();
 
-  // Allow cancel
   if (['/cancel', 'batal', 'cancel'].includes(text.toLowerCase())) {
     clearSess(ctx);
     await ctx.reply('Dibatalkan.');
@@ -845,7 +858,6 @@ bot.on('text', async (ctx, next) => {
 
   if (s.step === 'DESC') {
     s.data.description = text === '-' ? '' : text;
-
     const base = s.data.name
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
@@ -891,11 +903,9 @@ bot.on('text', async (ctx, next) => {
     return;
   }
 
-  // === Tambah stok (angka = jumlah, teks = daftar) ===
   if (s.step === 'ADD_STOCK') {
     const raw = text;
 
-    // 1) angka → generate dummy
     if (/^\d+$/.test(raw)) {
       const n = Math.min(500, Math.max(1, parseInt(raw, 10)));
       const base = (s.data.productName || 'ITEM').toString().toUpperCase().replace(/[^A-Z0-9]+/g, '-');
@@ -915,7 +925,6 @@ bot.on('text', async (ctx, next) => {
       return;
     }
 
-    // 2) daftar baris
     const lines = raw.split(/\r?\n|,/).map(l => l.trim()).filter(Boolean);
     if (!lines.length) {
       await ctx.reply('Tidak ada data. Kirim angka (jumlah) atau daftar credential (satu baris/satu item).');
@@ -952,10 +961,9 @@ bot.on('text', async (ctx, next) => {
     return;
   }
 
-  // kalau step tidak dikenali → teruskan ke handler lain
   return next();
 });
-// bot.hears('List Produk', async (ctx) => showProductList(ctx, 1));
+
 bot.hears('List Produk', async (ctx) => renderProductList(ctx, 1));
 bot.hears(/^Saldo: /, async (ctx) => ctx.reply(`Saldo kamu: Rp. 0`));
 bot.hears('Riwayat Transaksi', async (ctx) => {
@@ -971,17 +979,20 @@ bot.hears('❓ Cara Order', (ctx) =>
     'Cara order:\n' +
     '1) Tekan <b>List Produk</b>.\n' +
     '2) Pilih item → <b>Beli</b>.\n' +
-    '3) Bayar via Snap/QRIS.\n' +
+    '3) Bayar via link/QRIS.\n' +
     '4) Setelah pembayaran sukses, bot kirim akun/kode otomatis.',
     { parse_mode: 'HTML' }
   )
 );
 
+// === Start servers ===
 bot.launch().then(() => log('Telegram bot launched'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   log(`HTTP server on :${PORT}`);
-  log(`Webhook URL (Midtrans): ${PUBLIC_BASE_URL}/midtrans/webhook`);
+  log(`Webhook (generic): ${PUBLIC_BASE_URL}/payment/webhook`);
+  log(`Webhook (Tripay) : ${PUBLIC_BASE_URL}/tripay/webhook`);
+  log(`Webhook (Midtrans): ${PUBLIC_BASE_URL}/midtrans/webhook`);
 });
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
