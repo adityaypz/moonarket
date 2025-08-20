@@ -33,7 +33,6 @@ function shouldThrottle(id, ms = 2000) {
   cbqRate.set(id, now);
   return false;
 }
-// optional: bersihkan entri lama biar nggak numpuk
 setInterval(() => {
   const cutoff = Date.now() - 60_000; // 1 menit
   for (const [id, t] of cbqRate) if (t < cutoff) cbqRate.delete(id);
@@ -50,7 +49,6 @@ function clearSess(ctx) {
   const id = String(ctx.from?.id || '');
   adminSessions.delete(id);
 }
-// middleware guard sederhana
 function requireAdmin(handler) {
   return async (ctx, ...args) => {
     if (!isAdminCtx(ctx)) {
@@ -158,7 +156,6 @@ async function renderProductList(ctx, page = 1, messageId) {
     select: { id: true, name: true, priceIDR: true, slug: true }
   });
 
-  // header ringkas
   const lines = [
     `📦 <b>LIST PRODUK</b>`,
     `page ${page} / ${pages}`,
@@ -166,7 +163,6 @@ async function renderProductList(ctx, page = 1, messageId) {
     'Pilih produk di bawah ini:'
   ];
 
-  // hitung stok sekali
   const ids = items.map(i => i.id);
   let stockMap = new Map();
   if (ids.length) {
@@ -187,7 +183,6 @@ async function renderProductList(ctx, page = 1, messageId) {
     keyboard.push([{ text: label, callback_data: `INFO_${p.slug}_p${page}` }]);
   }
 
-  // nav
   const nav = [];
   if (page > 1) nav.push({ text: '◀️ Prev', callback_data: `CATALOG_${page - 1}` });
   nav.push({ text: `📄 ${page}/${pages}`, callback_data: 'NOOP' });
@@ -494,13 +489,11 @@ bot.on('callback_query', async (ctx) => {
     return; // penting
   }
 
-  // -------- [PATCH] label tengah (no-op) --------
   if (data === 'NOOP') {
     await ctx.answerCbQuery('Gunakan tombol Prev/Next ya 👌');
     return;
   }
 
-  // -------- [PATCH] Catalog paging --------
   if (data.startsWith('CATALOG_')) {
     const page = Number(data.replace('CATALOG_', '')) || 1;
     await ctx.answerCbQuery();
@@ -508,7 +501,6 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
-  // -------- [PATCH] Product detail --------
   if (data.startsWith('INFO_')) {
     await ctx.answerCbQuery();
     const [, slug, ptag] = data.split('_');
@@ -672,8 +664,6 @@ bot.on('callback_query', async (ctx) => {
 });
 
 // === WEBHOOKS ===
-
-// Normalizer → 1 jalur update DB & kirim credential
 async function handleNormalizedPayment(parsed, res) {
   const { orderId, status, provider } = parsed;
 
@@ -717,7 +707,6 @@ async function handleNormalizedPayment(parsed, res) {
     return res.json({ ok: true });
   }
 
-  // gagal / expired / cancel
   const failSet = new Set(['FAILED', 'EXPIRED', 'REFUND', 'CANCEL', 'DENY', 'EXPIRE', 'FAILURE']);
   if (failSet.has(String(status).toUpperCase())) {
     await prisma.order.update({ where: { id: order.id }, data: { status: STATUS.FAILED } });
@@ -740,7 +729,6 @@ app.post('/payment/webhook', async (req, res) => {
     parsed = Tripay.parseWebhook(req.body);
     verified = true;
   } else {
-    // Midtrans: verifikasi sesuai wrapper (gunakan raw body JSON)
     if (Midtrans.verifyWebhook(raw, req.header('X-Signature') || '')) {
       parsed = Midtrans.parseWebhook(JSON.parse(raw || '{}'));
       verified = true;
