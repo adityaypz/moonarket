@@ -336,7 +336,9 @@ async function handleBuy(ctx, slug) {
     }
   });
 
-  const pay = await createPayLink({
+  let pay;
+  try {
+  pay = await createPayLink({
     orderId: order.orderId,
     amount: order.priceIDR,
     customer: {
@@ -347,6 +349,15 @@ async function handleBuy(ctx, slug) {
     callbackUrl: `${process.env.PUBLIC_BASE_URL}/payment/webhook`,
     returnUrl: `${process.env.PUBLIC_BASE_URL}/thanks?o=${order.orderId}`
   });
+} catch (e) {
+  const msg = e?.response?.data?.message || e?.message || String(e);
+  await ctx.reply(
+    'Gagal membuat link pembayaran.\n' +
+    'Penyebab: ' + msg + '\n\n' +
+    'Coba pilih tombol QRIS (jika tersedia) atau hubungi admin.'
+  );
+  return; // penting: hentikan flow agar bot tidak crash
+}
 
   await ctx.reply(
     `🧾 Order <b>${esc(product.name)}</b>\n` +
@@ -741,11 +752,60 @@ app.post('/payment/webhook', async (req, res) => {
 
 // 2) Endpoint spesifik (Tripay)
 app.post('/tripay/webhook', async (req, res) => {
-  if (!Tripay.verifyWebhook(req.rawBody || '', req.header('X-Callback-Signature') || '')) {
-    return res.status(403).json({ ok: false });
+  try {
+    const sig = req.get('X-Callback-Signature') || '';
+    const event = req.get('X-Callback-Event') || '';
+    // verifikasi HMAC sha256 dari raw JSON body
+    if (!Tripay.verifyWebhook(req.rawBody, sig)) {
+      return res.status(403).json({ ok: false, message: 'invalid signature' });
+    }
+    // Tripay hanya kirim event "payment_status"
+    if (event !== 'payment_status') {
+      return res.json({ ok: true, ignored: true });
+    }
+
+    const data = Tripay.parseWebhook(req.body); // {provider, orderId, reference, status, amount}
+    const order = await prisma.order.findUnique({
+      where: { orderId: data.orderId },
+      include: { user: true, product: true }
+    });
+    if (!order) return res.status(404).json({ ok: false });
+
+    const status = String(data.status || '').toUpperCase();
+
+    if (Tripay.isPaid(status) && order.status !== STATUS.FULFILLED) {
+      if (order.status !== STATUS.PAID) {
+        await prisma.order.update({ where: { id: order.id }, data: { status: STATUS.PAID } });
+      }
+      const credential = await prisma.productCredential.findFirst({
+        where: { productId: order.productId, isUsed: false },
+        orderBy: { id: 'asc' }
+      });
+      if (!credential) {
+        await notifyUser(order.user.telegramId, `Pembayaran <b>${esc(order.product.name)}</b> sukses ✅\nTapi stok habis, admin akan follow up.`, true);
+        return res.json({ ok: true, note: 'Paid, no stock' });
+      }
+      await prisma.productCredential.update({ where: { id: credential.id }, data: { isUsed: true, usedAt: new Date() } });
+      await prisma.order.update({ where: { id: order.id }, data: { status: STATUS.FULFILLED, deliveredPayload: credential.payload } });
+
+      const msg =
+        `Terima kasih! Pembayaran <b>${esc(order.product.name)}</b> sukses ✅\n\n` +
+        `Data:\n<pre><code>${esc(credential.payload)}</code></pre>`;
+      await notifyUser(order.user.telegramId, msg, true);
+      return res.json({ ok: true, fulfilled: true });
+    }
+
+    if (['FAILED', 'EXPIRED', 'CANCEL', 'REFUND'].includes(status)) {
+      await prisma.order.update({ where: { id: order.id }, data: { status: STATUS.FAILED } });
+      await notifyUser(order.user.telegramId, `Transaksi <b>${esc(order.product.name)}</b> ${status}.`, true);
+      return res.json({ ok: true });
+    }
+
+    return res.json({ ok: true, status });
+  } catch (e) {
+    error('tripay webhook error', e);
+    return res.status(500).json({ ok: false, message: e.message });
   }
-  const parsed = Tripay.parseWebhook(req.body);
-  await handleNormalizedPayment(parsed, res);
 });
 
 // 3) Endpoint spesifik (Midtrans)
@@ -810,7 +870,33 @@ bot.command('admin', requireAdmin(async (ctx) => {
     }
   );
 }));
+// === Stok per produk (khusus admin) ===
+bot.command(['stokadmin', 'adminstok'], requireAdmin(async (ctx) => {
+  const items = await prisma.product.findMany({ orderBy: { id: 'asc' } });
+  if (!items.length) return ctx.reply('Belum ada produk.');
 
+  for (const p of items) {
+    const stock = await prisma.productCredential.count({
+      where: { productId: p.id, isUsed: false }
+    });
+
+    await ctx.reply(
+      `<b>${esc(p.name)}</b>\n` +
+      `Harga : ${formatIDR(p.priceIDR)}\n` +
+      `Status: ${p.isActive ? 'AKTIF' : 'NONAKTIF'}\n` +
+      `Slug  : <code>${esc(p.slug)}</code>\n` +
+      `Stok  : ${stock}`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '➕ Tambah Stok', callback_data: `ADMIN_ADD_STOCK_${p.slug}` }]
+          ]
+        }
+      }
+    );
+  }
+}));
 // === Wizard Tambah Produk (khusus admin) ===
 bot.on('text', async (ctx, next) => {
   const s = getSess(ctx);
