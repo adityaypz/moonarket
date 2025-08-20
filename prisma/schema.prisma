@@ -1,0 +1,60 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  telegramId   String   @unique
+  username     String?
+  firstName    String?
+  lastName     String?
+  orders       Order[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Product {
+  id           Int      @id @default(autoincrement())
+  name         String
+  slug         String   @unique
+  description  String?
+  priceIDR     Int
+  isActive     Boolean  @default(true)
+  credentials  ProductCredential[]
+  orders       Order[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model ProductCredential {
+  id           Int      @id @default(autoincrement())
+  productId    Int
+  payload      String
+  isUsed       Boolean  @default(false)
+  usedAt       DateTime?
+  createdAt    DateTime @default(now())
+
+  product      Product  @relation(fields: [productId], references: [id])
+}
+
+model Order {
+  id                 Int      @id @default(autoincrement())
+  orderId            String   @unique
+  midtransOrderId    String?
+  userId             Int
+  productId          Int
+  priceIDR           Int
+  status             String   @default("PENDING") // use union in app layer
+  deliveredPayload   String?
+  lastMidtransState  String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  user               User     @relation(fields: [userId], references: [id])
+  product            Product  @relation(fields: [productId], references: [id])
+}
