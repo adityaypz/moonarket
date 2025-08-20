@@ -4,10 +4,12 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "dev": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
     "prisma:gen": "prisma generate",
     "prisma:push": "prisma db push",
-    "seed": "node prisma/seed.js"
+    "seed": "node prisma/seed.js",
+    "postinstall": "prisma generate || true"
   },
   "dependencies": {
     "@prisma/client": "^5.17.0",
