@@ -41,18 +41,30 @@ npm install
 ### 3. Setup Environment
 Buat file `.env`:
 ```env
-BOT_TOKEN=your_telegram_bot_token
-ADMIN_IDS=123456789,987654321   # ID Telegram admin
-PUBLIC_BASE_URL=https://domainkamu.com
+# TELEGRAM
+TELEGRAM_BOT_TOKEN=
+PUBLIC_BASE_URL=webmu    # tanpa trailing slash
 
-# Tripay
-TRIPAY_API_KEY=your_tripay_api_key
-TRIPAY_PRIVATE_KEY=your_tripay_private_key
-TRIPAY_MERCHANT_CODE=your_merchant_code
+# PILIH GATEWAY (tripay | midtrans)
+PAYMENT_PROVIDER=tripay
 
-# Midtrans (optional)
-MIDTRANS_SERVER_KEY=your_midtrans_server_key
-MIDTRANS_CLIENT_KEY=your_midtrans_client_key
+# TRIPAY
+TRIPAY_API_KEY_PUBLIC=
+TRIPAY_API_KEY_PRIVATE=
+TRIPAY_MERCHANT_CODE=
+TRIPAY_BASE_URL=https://www.tripay.co.id/api
+
+# MIDTRANS (isi kalau mau pakai midtrans)
+MIDTRANS_SERVER_KEY=
+MIDTRANS_CLIENT_KEY=
+MIDTRANS_IS_PRODUCTION=false
+MIDTRANS_QRIS_ACQUIRER=gopay
+
+# DATABASE
+DATABASE_URL="file:./dev.db"
+
+# ADMIN ID'S (boleh banyak, pisah koma)
+ADMIN_IDS=
 ```
 
 ### 4. Database Setup (Prisma + SQLite)
