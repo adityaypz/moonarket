@@ -150,5 +150,5 @@ src/
 ---
 
 ## ⚡ Credits
-Dibuat oleh **Moonarket Team** dengan ❤️  
+Dibuat oleh **Moonafic** dengan ❤️  
 Integrasi: [Tripay](https://tripay.co.id) | [Midtrans](https://midtrans.com)  
