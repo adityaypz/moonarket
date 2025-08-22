@@ -29,8 +29,8 @@ Fitur utama: auto-generate order, pembayaran via Tripay, auto-delivery produk se
 
 ### 1. Clone Project
 ```bash
-git clone https://github.com/username/telegram-marketplace-bot.git
-cd telegram-marketplace-bot
+git clone https://github.com/adityaypz/moonarket
+cd moonarket
 ```
 
 ### 2. Install Dependencies
